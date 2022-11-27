@@ -81,6 +81,9 @@ class Track:
         self._max_age = max_age
         self.class_name = class_name
 
+        # custom props
+        self.is_dropped = False
+
     def to_tlwh(self):
         """Get current position in bounding box format `(top left x, top left y,
         width, height)`.

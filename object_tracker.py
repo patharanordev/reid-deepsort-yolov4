@@ -2,6 +2,7 @@ import os
 # comment out below line to enable tensorflow logging outputs
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import time
+import math
 import tensorflow as tf
 physical_devices = tf.config.experimental.list_physical_devices('GPU')
 if len(physical_devices) > 0:
@@ -23,7 +24,7 @@ from deep_sort import preprocessing, nn_matching
 from deep_sort.detection import Detection
 from deep_sort.tracker import Tracker
 from tools import generate_detections as gdet
-
+from collections import deque
 from handler.recorder import Recorder
 
 flags.DEFINE_string('framework', 'tf', '(tf, tflite, trt')
@@ -40,6 +41,12 @@ flags.DEFINE_float('score', 0.50, 'score threshold')
 flags.DEFINE_boolean('dont_show', False, 'dont show video output')
 flags.DEFINE_boolean('info', False, 'show detailed info of tracked objects')
 flags.DEFINE_boolean('count', False, 'count objects being tracked on screen')
+
+pts = [deque(maxlen=30) for _ in range(9999)]
+
+def calculateDistance(x1,y1,x2,y2):
+    dist = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+    return dist
 
 def main(_argv):
     # Definition of the parameters
@@ -96,6 +103,12 @@ def main(_argv):
         out = cv2.VideoWriter(FLAGS.output, codec, fps, (width, height))
 
     frame_num = 0
+
+    # re-initial
+    fps = 0.0
+        
+    dropped_list = {}
+    
     # while video is running
     while True:
         return_value, frame = vid.read()
@@ -154,6 +167,7 @@ def main(_argv):
         # format bounding boxes from normalized ymin, xmin, ymax, xmax ---> xmin, ymin, width, height
         original_h, original_w, _ = frame.shape
         bboxes = utils.format_boxes(bboxes, original_h, original_w)
+        default_drop_distance = original_h / 8
 
         # store all predictions in one parameter for simplicity when calling functions
         pred_bbox = [bboxes, scores, classes, num_objects]
@@ -161,11 +175,11 @@ def main(_argv):
         # read in all class names from config
         class_names = utils.read_class_names(cfg.YOLO.CLASSES)
 
-        # # by default allow all classes in .names file
-        # allowed_classes = list(class_names.values())
+        # by default allow all classes in .names file
+        allowed_classes = list(class_names.values())
         
-        # custom allowed classes (uncomment line below to customize tracker for only people)
-        allowed_classes = ['person']
+        # # custom allowed classes (uncomment line below to customize tracker for only people)
+        # allowed_classes = ['person']
 
         # loop through objects and use class index to get class name, allow only classes in allowed_classes list
         names = []
@@ -212,24 +226,60 @@ def main(_argv):
             bbox = track.to_tlbr()
             class_name = track.get_class()
 
-        # draw bbox on screen
+            # draw bbox on screen
             color = colors[int(track.track_id) % len(colors)]
             color = [i * 255 for i in color]
             cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
             cv2.rectangle(frame, (int(bbox[0]), int(bbox[1]-30)), (int(bbox[0])+(len(class_name)+len(str(track.track_id)))*17, int(bbox[1])), color, -1)
             cv2.putText(frame, class_name + "-" + str(track.track_id),(int(bbox[0]), int(bbox[1]-10)),0, 0.75, (255,255,255),2)
 
-        # Custom handler
+            # Custom handler
             specific_roi = frame[int(bbox[1]):int(bbox[3]), int(bbox[0]):int(bbox[2])]
             recorder.record(track.track_id, class_name, specific_roi)
 
+            # draw center point of the object
+            center = (int( (bbox[0] + bbox[2])/2 ), int( (bbox[1]+bbox[3])/2 ) )
 
-        # if enable info flag then print details about each track
+            pts[track.track_id].append(center)
+
+            thickness = 5
+            #center point
+            cv2.circle(frame,  (center), 1, color, thickness)
+
+			# draw motion path
+            for j in range(1, len(pts[track.track_id])):
+                if pts[track.track_id][j - 1] is None or pts[track.track_id][j] is None:
+                   continue
+                thickness = int(np.sqrt(64 / float(j + 1)) * 2)
+                cv2.line(frame,(pts[track.track_id][j-1]), (pts[track.track_id][j]),(color),thickness)
+
+            # Add to cart if y(t) - y(t-1) more than 1/8 of high of screen
+            if (pts[track.track_id][-1][1] - pts[track.track_id][0][1]) > default_drop_distance:
+                track.is_dropped = True
+                dropped_list[class_name] = 1
+            else:
+                if class_name in dropped_list:
+                    del dropped_list[class_name]
+            
+            # if enable info flag then print details about each track
             if FLAGS.info:
-                print("Tracker ID: {}, Class: {},  BBox Coords (xmin, ymin, xmax, ymax): {}".format(str(track.track_id), class_name, (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))))
+                print("Tracker ID : {}, Class: {},  BBox Coords (xmin, ymin, xmax, ymax): {}".format(
+                    str(track.track_id), 
+                    class_name, 
+                    ( int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]) ) 
+                ))
+
+        # update buy list
+        buy_list = ''
+        for product_index, product_name in enumerate(dropped_list):
+            buy_list = buy_list + product_name + ', '
+        
+        cv2.putText(frame, "{}".format(buy_list), (5, 35), cv2.FONT_HERSHEY_COMPLEX_SMALL, 2, (0, 255, 0), 2)
 
         # calculate frames per second of running detections
-        fps = 1.0 / (time.time() - start_time)
+        # fps = 1.0 / (time.time() - start_time)
+        fps  = ( fps + (1./(time.time()-start_time)) ) / 2
+
         print("FPS: %.2f" % fps)
         result = np.asarray(frame)
         result = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -240,7 +290,19 @@ def main(_argv):
         # if output flag is set, save video file
         if FLAGS.output:
             out.write(result)
+
+        # press 'q' to stop
         if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+
+
+    if len(pts[track.track_id]) != None:
+        print(args["input"][43:57]+": "+ str(count) + " " + str(class_name) +' Found')
+    else:
+        print("[No Found]")
+
+
+    vid.release()
     cv2.destroyAllWindows()
 
     recorder.export('./output.csv')
